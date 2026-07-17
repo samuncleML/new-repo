@@ -342,9 +342,9 @@ def main():
     param_groups = []
 
     STAGES = [
-    {'img_size': 32, 'epochs': 270, 'lr': 1e-3, 'batch_size': 64},
-    {'img_size': 64, 'epochs': 70, 'lr': 7e-4, 'batch_size': 32},
-    {'img_size': 128, 'epochs': 30, 'lr': 5e-4, 'batch_size': 32},
+    {'img_size': 32, 'epochs': 50, 'lr': 1e-3, 'batch_size': 64},
+    {'img_size': 64, 'epochs': 25, 'lr': 7e-4, 'batch_size': 32},
+    {'img_size': 128, 'epochs': 15, 'lr': 5e-4, 'batch_size': 32},
     {'img_size': 224, 'epochs': 10, 'lr': 2e-4, 'batch_size': 8 },
     ]
 
