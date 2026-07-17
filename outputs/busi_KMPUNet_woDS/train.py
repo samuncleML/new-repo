@@ -164,7 +164,7 @@ def parse_args():
 
 
 
-def train(config, train_loader, model, criterion, optimizer, device, scaler):
+def train(config, train_loader, model, criterion, optimizer, device):
     avg_meters = {'loss': AverageMeter(),
                   'iou': AverageMeter()}
 
@@ -177,30 +177,25 @@ def train(config, train_loader, model, criterion, optimizer, device, scaler):
 
         # compute output
         if config['deep_supervision']:
-            with autocast(device_type='cpu'):
-                outputs = model(input)
-                loss = 0
-                for output in outputs:
-                    loss += criterion(output, target)
-                loss /= len(outputs)
+            outputs = model(input)
+            loss = 0
+            for output in outputs:
+                loss += criterion(output, target)
+            loss /= len(outputs)
 
-                iou, dice, _ = iou_score(outputs[-1], target)
-                iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(outputs[-1], target)
+            iou, dice, _ = iou_score(outputs[-1], target)
+            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(outputs[-1], target)
             
         else:
-            with autocast(device_type='cpu', dtype=torch.float16):
-                output = model(input)
-                loss = criterion(output, target)
-                iou, dice, _ = iou_score(output, target)
-                iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(output, target)
+            output = model(input)
+            loss = criterion(output, target)
+            iou, dice, _ = iou_score(output, target)
+            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(output, target)
 
         # compute gradient and do optimizing step
         optimizer.zero_grad()
-        scaler.scale(loss).backward()             # scaled FP16 gradients
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()             # scaled FP16 gradients
+        optimizer.step()
 
         avg_meters['loss'].update(loss.item(), input.size(0))
         avg_meters['iou'].update(iou, input.size(0))
@@ -272,6 +267,7 @@ def seed_torch(seed=1029):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
+time_list = []
 
 def main():
     seed_torch()
@@ -346,14 +342,13 @@ def main():
     param_groups = []
 
     STAGES = [
-    {'img_size': 32, 'epochs': 250, 'lr': 1e-3, 'batch_size': 64},
+    {'img_size': 32, 'epochs': 2, 'lr': 1e-3, 'batch_size': 64},
     {'img_size': 64, 'epochs': 50, 'lr': 7e-4, 'batch_size': 32},
     {'img_size': 128, 'epochs': 70, 'lr': 5e-4, 'batch_size': 32},
     {'img_size': 224, 'epochs': 30, 'lr': 2e-4, 'batch_size': 8 },
     ]
 
     counter = 0
-    scaler = GradScaler()
 
     for stage in STAGES:
 
@@ -385,7 +380,9 @@ def main():
                 weight_decay=config['weight_decay']
             )
         else:
-            raise NotImplementedError
+            optimizer = temp
+        
+        temp = optimizer
         
         # Resume from checkpoint if provided
         start_epoch = 0 if stage == STAGES[0] else counter
@@ -498,17 +495,6 @@ def main():
             drop_last=False
         )
 
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr        = 1e-3,          
-            epochs        = 400,
-            steps_per_epoch = len(train_loader),
-            pct_start     = 0.3,           
-            anneal_strategy = 'cos',
-            div_factor    = 25,            
-            final_div_factor = 1e4        
-        )
-
 
         initial_training_time = time.perf_counter()
     
@@ -520,7 +506,7 @@ def main():
             print('Epoch [%d/%d]' % (epoch, config['epochs']))
 
             # train for one epoch
-            train_log = train(config, train_loader, model, criterion, optimizer, device, scaler)
+            train_log = train(config, train_loader, model, criterion, optimizer, device)
 
             if config['scheduler'] == 'CosineAnnealingLR':
                 scheduler.step()
@@ -559,7 +545,8 @@ def main():
 
             torch.cuda.empty_cache()
             time_per_epoch = time.perf_counter() - initial
-            print(f'Time used for each epoch is {time_per_epoch}')
+            print(f'Time used for this epoch is {time_per_epoch}')
+            time_list.append(time_per_epoch)
     
     total_training_time = initial_training_time - time.perf_counter()
     total_minutes = total_training_time/60
@@ -579,5 +566,7 @@ def main():
 
     my_writer.close()
 
+
 if __name__ == '__main__':
     main()
+    print(time_list)
