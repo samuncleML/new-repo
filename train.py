@@ -6,6 +6,8 @@ from collections import OrderedDict
 from glob import glob
 import random
 import numpy as np
+from torch.optim.lr_scheduler import OneCycleLR
+from torch.amp import autocast, GradScaler
 
 import pandas as pd
 import torch
@@ -162,7 +164,7 @@ def parse_args():
 
 
 
-def train(config, train_loader, model, criterion, optimizer, device):
+def train(config, train_loader, model, criterion, optimizer, device, scaler):
     avg_meters = {'loss': AverageMeter(),
                   'iou': AverageMeter()}
 
@@ -175,25 +177,30 @@ def train(config, train_loader, model, criterion, optimizer, device):
 
         # compute output
         if config['deep_supervision']:
-            outputs = model(input)
-            loss = 0
-            for output in outputs:
-                loss += criterion(output, target)
-            loss /= len(outputs)
+            with autocast(device_type='cpu'):
+                outputs = model(input)
+                loss = 0
+                for output in outputs:
+                    loss += criterion(output, target)
+                loss /= len(outputs)
 
-            iou, dice, _ = iou_score(outputs[-1], target)
-            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(outputs[-1], target)
+                iou, dice, _ = iou_score(outputs[-1], target)
+                iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(outputs[-1], target)
             
         else:
-            output = model(input)
-            loss = criterion(output, target)
-            iou, dice, _ = iou_score(output, target)
-            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(output, target)
+            with autocast(device_type='cpu', dtype=torch.float16):
+                output = model(input)
+                loss = criterion(output, target)
+                iou, dice, _ = iou_score(output, target)
+                iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(output, target)
 
         # compute gradient and do optimizing step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()             # scaled FP16 gradients
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
         avg_meters['loss'].update(loss.item(), input.size(0))
         avg_meters['iou'].update(iou, input.size(0))
@@ -338,190 +345,221 @@ def main():
 
     param_groups = []
 
-    for name, param in model.named_parameters():
-        if 'layer' in name.lower() and 'fc' in name.lower():  # higher lr for kan layers
-            param_groups.append({
-                'params': param,
-                'lr': config['kan_lr'],
-                'weight_decay': config['kan_weight_decay']
-            })
+    STAGES = [
+    {'img_size': 32, 'epochs': 250, 'lr': 1e-3, 'batch_size': 64},
+    {'img_size': 64, 'epochs': 50, 'lr': 7e-4, 'batch_size': 32},
+    {'img_size': 128, 'epochs': 70, 'lr': 5e-4, 'batch_size': 32},
+    {'img_size': 224, 'epochs': 30, 'lr': 2e-4, 'batch_size': 8 },
+    ]
+
+    counter = 0
+    scaler = GradScaler()
+
+    for stage in STAGES:
+
+        for name, param in model.named_parameters():
+            if 'layer' in name.lower() and 'fc' in name.lower():  # higher lr for kan layers
+                param_groups.append({
+                    'params': param,
+                    'lr': config['kan_lr'],
+                    'weight_decay': config['kan_weight_decay']
+                })
+            else:
+                param_groups.append({
+                    'params': param,
+                    'lr': stage['lr'],
+                    'weight_decay': config['weight_decay']
+                })
+
+        stage_condition = stage == STAGES[0]
+        if config['optimizer'] == 'Adam' and stage_condition:
+            optimizer = optim.Adam(param_groups)
+        elif config['optimizer'] == 'AdamW' and stage_condition:
+            optimizer = optim.AdamW(param_groups)
+        elif config['optimizer'] == 'SGD' and stage_condition:
+            optimizer = optim.SGD(
+                param_groups,
+                lr=config['lr'],
+                momentum=config['momentum'],
+                nesterov=config['nesterov'],
+                weight_decay=config['weight_decay']
+            )
         else:
-            param_groups.append({
-                'params': param,
-                'lr': config['lr'],
-                'weight_decay': config['weight_decay']
-            })
-
-    if config['optimizer'] == 'Adam':
-        optimizer = optim.Adam(param_groups)
-    elif config['optimizer'] == 'AdamW':
-        optimizer = optim.AdamW(param_groups)
-    elif config['optimizer'] == 'SGD':
-        optimizer = optim.SGD(
-            param_groups,
-            lr=config['lr'],
-            momentum=config['momentum'],
-            nesterov=config['nesterov'],
-            weight_decay=config['weight_decay']
-        )
-    else:
-        raise NotImplementedError
-    
-    # Resume from checkpoint if provided
-    start_epoch = 0
-    log = OrderedDict([
-        ('epoch', []),
-        ('lr', []),
-        ('loss', []),
-        ('iou', []),
-    ])
-    if config['resume_from']:
-        print(f"=> resuming from checkpoint: {config['resume_from']}")
-        checkpoint = torch.load(config['resume_from'], map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        log = checkpoint.get('log', log)
-        print(f"=> resuming at epoch {start_epoch}/{config['epochs']}")
-
-    if config['scheduler'] == 'CosineAnnealingLR':
-        scheduler = lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config['epochs'], eta_min=config['min_lr'],
-            last_epoch=start_epoch - 1
-        )
-    elif config['scheduler'] == 'ReduceLROnPlateau':
-        scheduler = lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            factor=config['factor'],
-            patience=config['patience'],
-            verbose=1,
-            min_lr=config['min_lr']
-        )
-    elif config['scheduler'] == 'MultiStepLR':
-        scheduler = lr_scheduler.MultiStepLR(
-            optimizer,
-            milestones=[int(e) for e in config['milestones'].split(',')],
-            gamma=config['gamma'],
-            last_epoch=start_epoch - 1
-        )
-    elif config['scheduler'] == 'ConstantLR':
-        scheduler = None
-    else:
-        raise NotImplementedError
-
-    shutil.copy2('train.py', f'{output_dir}/{exp_name}/')
-    shutil.copy2('src/archs.py', f'{output_dir}/{exp_name}/')
-
-    # Data loading code
-    img_dir = os.path.join(config['data_dir'], config['dataset'], 'images')
-    mask_dir = os.path.join(config['data_dir'], config['dataset'], 'masks')
-
-    img_ids = sorted(glob(os.path.join(img_dir, '*' + img_ext)))
-    img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
-
-    print(f"Loaded {len(img_ids)} images from {img_dir}")
-    
-    train_img_ids, val_img_ids = train_test_split(
-        img_ids,
-        test_size=0.2,
-        random_state=config['dataseed']
-    )
-
-    train_transform = A.Compose([
-        A.RandomRotate90(),
-        A.HorizontalFlip(),
-        A.Resize(config['input_h'], config['input_w']),
-        A.Normalize(),
-    ])
-
-    val_transform = A.Compose([
-        A.Resize(config['input_h'], config['input_w']),
-        A.Normalize(),
-    ])
-
-    train_dataset = Dataset(
-        img_ids=train_img_ids,
-        img_dir=img_dir,
-        mask_dir=mask_dir,
-        img_ext=img_ext,
-        mask_ext=mask_ext,
-        num_classes=config['num_classes'],
-        transform=train_transform
-    )
-
-    val_dataset = Dataset(
-        img_ids=val_img_ids,
-        img_dir=img_dir,
-        mask_dir=mask_dir,
-        img_ext=img_ext,
-        mask_ext=mask_ext,
-        num_classes=config['num_classes'],
-        transform=val_transform
-    )
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=config['num_workers'],
-        drop_last=True
-    )
-
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=config['num_workers'],
-        drop_last=False
-    )
-
-
-    initial_training_time = time.perf_counter()
-    for epoch in range(start_epoch, config['epochs']):
-
-        initial = time.perf_counter()
-        print('Epoch [%d/%d]' % (epoch, config['epochs']))
-
-        # train for one epoch
-        train_log = train(config, train_loader, model, criterion, optimizer, device)
+            raise NotImplementedError
+        
+        # Resume from checkpoint if provided
+        start_epoch = 0 if stage == STAGES[0] else counter
+        log = OrderedDict([
+            ('epoch', []),
+            ('lr', []),
+            ('loss', []),
+            ('iou', []),
+        ])
+        if config['resume_from']:
+            print(f"=> resuming from checkpoint: {config['resume_from']}")
+            checkpoint = torch.load(config['resume_from'], map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            log = checkpoint.get('log', log)
+            print(f"=> resuming at epoch {start_epoch}/{config['epochs']}")
 
         if config['scheduler'] == 'CosineAnnealingLR':
-            scheduler.step()
+            scheduler = lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=config['epochs'], eta_min=config['min_lr'],
+                last_epoch=start_epoch - 1
+            )
+        elif config['scheduler'] == 'ReduceLROnPlateau':
+            scheduler = lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                factor=config['factor'],
+                patience=config['patience'],
+                verbose=1,
+                min_lr=config['min_lr']
+            )
         elif config['scheduler'] == 'MultiStepLR':
+            scheduler = lr_scheduler.MultiStepLR(
+                optimizer,
+                milestones=[int(e) for e in config['milestones'].split(',')],
+                gamma=config['gamma'],
+                last_epoch=start_epoch - 1
+            )
+        elif config['scheduler'] == 'ConstantLR':
+            scheduler = None
+        else:
+            raise NotImplementedError
+        
+
+        shutil.copy2('train.py', f'{output_dir}/{exp_name}/')
+        shutil.copy2('src/archs.py', f'{output_dir}/{exp_name}/')
+
+        # Data loading code
+        img_dir = os.path.join(config['data_dir'], config['dataset'], 'images')
+        mask_dir = os.path.join(config['data_dir'], config['dataset'], 'masks')
+
+        img_ids = sorted(glob(os.path.join(img_dir, '*' + img_ext)))
+        img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
+
+        print(f"Loaded {len(img_ids)} images from {img_dir}")
+        
+        
+    
+        train_img_ids, val_img_ids = train_test_split(
+            img_ids,
+            test_size=0.2,
+            random_state=config['dataseed']
+        )
+
+        train_transform = A.Compose([
+            A.RandomRotate90(),
+            A.HorizontalFlip(),
+            A.Resize(stage['img_size'], stage['img_size']),
+            A.Normalize(),
+        ])
+
+        val_transform = A.Compose([
+            A.Resize(stage['img_size'], stage['img_size']),
+            A.Normalize(),
+        ])
+
+        train_dataset = Dataset(
+            img_ids=train_img_ids,
+            img_dir=img_dir,
+            mask_dir=mask_dir,
+            img_ext=img_ext,
+            mask_ext=mask_ext,
+            num_classes=config['num_classes'],
+            transform=train_transform
+        )
+
+        val_dataset = Dataset(
+            img_ids=val_img_ids,
+            img_dir=img_dir,
+            mask_dir=mask_dir,
+            img_ext=img_ext,
+            mask_ext=mask_ext,
+            num_classes=config['num_classes'],
+            transform=val_transform
+        )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=stage['batch_size'],
+            shuffle=True,
+            num_workers=config['num_workers'],
+            drop_last=True
+        )
+
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=config['num_workers'],
+            drop_last=False
+        )
+
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr        = 1e-3,          
+            epochs        = 400,
+            steps_per_epoch = len(train_loader),
+            pct_start     = 0.3,           
+            anneal_strategy = 'cos',
+            div_factor    = 25,            
+            final_div_factor = 1e4        
+        )
+
+
+        initial_training_time = time.perf_counter()
+    
+        start_epoch = 0 if stage == STAGES[0] else counter
+        for epoch in range(start_epoch, stage['epochs']):
+
+            initial = time.perf_counter()
+            counter += 1
+            print('Epoch [%d/%d]' % (epoch, config['epochs']))
+
+            # train for one epoch
+            train_log = train(config, train_loader, model, criterion, optimizer, device, scaler)
+
+            if config['scheduler'] == 'CosineAnnealingLR':
+                scheduler.step()
+            elif config['scheduler'] == 'MultiStepLR':
+                scheduler.step()
+            
             scheduler.step()
-        # Note: ReduceLROnPlateau is not supported in this setup since it
-        # requires per-epoch validation loss, which we no longer compute.
+            # Note: ReduceLROnPlateau is not supported in this setup since it
+            # requires per-epoch validation loss, which we no longer compute.
 
-        print('loss %.4f - iou %.4f' % (train_log['loss'], train_log['iou']))
+            print('loss %.4f - iou %.4f' % (train_log['loss'], train_log['iou']))
 
-        # 记录当前学习率
-        current_lrs = [param_group['lr'] for param_group in optimizer.param_groups]
-        log['epoch'].append(epoch)
-        log['lr'].append(current_lrs)
-        log['loss'].append(train_log['loss'])
-        log['iou'].append(train_log['iou'])
+            # 记录当前学习率
+            current_lrs = [param_group['lr'] for param_group in optimizer.param_groups]
+            log['epoch'].append(epoch)
+            log['lr'].append(current_lrs)
+            log['loss'].append(train_log['loss'])
+            log['iou'].append(train_log['iou'])
 
-        pd.DataFrame(log).to_csv(f'{output_dir}/{exp_name}/log.csv', index=False)
+            pd.DataFrame(log).to_csv(f'{output_dir}/{exp_name}/log.csv', index=False)
 
-        my_writer.add_scalar('train/loss', train_log['loss'], global_step=epoch)
-        my_writer.add_scalar('train/iou', train_log['iou'], global_step=epoch)
+            my_writer.add_scalar('train/loss', train_log['loss'], global_step=epoch)
+            my_writer.add_scalar('train/iou', train_log['iou'], global_step=epoch)
 
-        # Save a rolling checkpoint every 5 epochs so a Colab disconnect
-        # doesn't lose all progress. Overwrites the same file each time.
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == config['epochs']:
+            # Save a rolling checkpoint every epoch so a Colab disconnect
+            # doesn't lose all progress. Overwrites the same file each time.
             checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'config': config,
-                'log': log,
-            }
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'config': config,
+                    'log': log,
+                }
             torch.save(checkpoint, f'{output_dir}/{exp_name}/checkpoint_latest.pth')
             print(f'=> saved checkpoint at epoch {epoch+1}')
 
-        torch.cuda.empty_cache()
-        time_per_epoch = time.perf_counter() - initial
-        print(f'Time used for each epoch is {time_per_epoch}')
+            torch.cuda.empty_cache()
+            time_per_epoch = time.perf_counter() - initial
+            print(f'Time used for each epoch is {time_per_epoch}')
     
     total_training_time = initial_training_time - time.perf_counter()
     total_minutes = total_training_time/60
