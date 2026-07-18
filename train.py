@@ -495,7 +495,7 @@ def main():
 
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
-            batch_size=config['batch_size'],
+            batch_size=stage['batch_size'],
             shuffle=False,
             num_workers=config['num_workers'],
             drop_last=False
