@@ -450,7 +450,6 @@ def main():
             A.RandomRotate90(),
             A.HorizontalFlip(),
             A.Resize(stage['img_size'], stage['img_size']),
-            A.Normalize(),
         ])
 
         val_transform = A.Compose([
@@ -485,6 +484,24 @@ def main():
             num_workers=config['num_workers'],
             drop_last=True
         )
+
+        std = 0.0
+        mean = 0.0
+        total_samples = 0
+
+        for input, target, _ in train_loader:
+            batch_samples = input.size(0)
+
+            input = input.view(batch_samples, input.size(1), -1)
+            mean += input.mean(2).sum(0)
+            std += input.std(2).sum(0)
+            total_samples += batch_samples
+
+            mean /= total_samples
+            std /= total_samples
+
+        print(f"Dataset Mean: {mean.tolist()}")
+        print(f"Dataset Std: {std.tolist()}")
 
         val_loader = torch.utils.data.DataLoader(
             val_dataset,

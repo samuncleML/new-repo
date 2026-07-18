@@ -450,12 +450,19 @@ def main():
             A.RandomRotate90(),
             A.HorizontalFlip(),
             A.Resize(stage['img_size'], stage['img_size']),
-            A.Normalize(),
+            A.Normalize(
+                mean = (0.037522561848163605, 0.03752995654940605, 0.03753070905804634),
+                std = (0.02222472056746483, 0.022226329892873764, 0.0222284197807312)
+            ),
         ])
 
         val_transform = A.Compose([
             A.Resize(stage['img_size'], stage['img_size']),
-            A.Normalize(),
+            A.Normalize(
+                mean = (0.037522561848163605, 0.03752995654940605, 0.03753070905804634),
+                std = (0.02222472056746483, 0.022226329892873764, 0.0222284197807312)
+
+            ),
         ])
 
         train_dataset = Dataset(
