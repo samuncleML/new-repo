@@ -341,9 +341,104 @@ def main():
 
     param_groups = []
 
+    
+
+    for name, param in model.named_parameters():
+        if 'layer' in name.lower() and 'fc' in name.lower():  # higher lr for kan layers
+            param_groups.append({
+                'params': param,
+                'lr': config['kan_lr'],
+                'weight_decay': config['kan_weight_decay']
+            })
+        else:
+            param_groups.append({
+                'params': param,
+                'lr': config['lr'],
+                'weight_decay': config['weight_decay']
+            })
+
+    if config['optimizer'] == 'Adam':
+        optimizer = optim.Adam(param_groups)
+    elif config['optimizer'] == 'AdamW':
+        optimizer = optim.AdamW(param_groups)
+    elif config['optimizer'] == 'SGD':
+        optimizer = optim.SGD(
+            param_groups,
+            lr=config['lr'],
+            momentum=config['momentum'],
+            nesterov=config['nesterov'],
+            weight_decay=config['weight_decay']
+        )
+    else:
+        raise NotImplementedError
+                
+        # Resume from checkpoint if provided
+    start_epoch = 0
+    log = OrderedDict([
+        ('epoch', []),
+        ('lr', []),
+        ('loss', []),
+        ('iou', []),
+    ])
+
+    if config['resume_from']:
+        print(f"=> resuming from checkpoint: {config['resume_from']}")
+        checkpoint = torch.load(config['resume_from'], map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        log = checkpoint.get('log', log)
+        print(f"=> resuming at epoch {start_epoch}/{config['epochs']}")
+
+    if config['scheduler'] == 'CosineAnnealingLR':
+        scheduler = lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config['epochs'], eta_min=config['min_lr'],
+        last_epoch=start_epoch - 1
+      )
+    elif config['scheduler'] == 'ReduceLROnPlateau':
+        scheduler = lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        factor=config['factor'],
+        patience=config['patience'],
+        verbose=1,
+        min_lr=config['min_lr']
+            )
+    elif config['scheduler'] == 'MultiStepLR':
+        scheduler = lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=[int(e) for e in config['milestones'].split(',')],
+        gamma=config['gamma'],
+        last_epoch=start_epoch - 1
+            )
+    elif config['scheduler'] == 'ConstantLR':
+         scheduler = None
+    else:
+        raise NotImplementedError
+        
+
+    shutil.copy2('train.py', f'{output_dir}/{exp_name}/')
+    shutil.copy2('src/archs.py', f'{output_dir}/{exp_name}/')
+
+    # Data loading code
+    img_dir = os.path.join(config['data_dir'], config['dataset'], 'images')
+    mask_dir = os.path.join(config['data_dir'], config['dataset'], 'masks')
+
+    img_ids = sorted(glob(os.path.join(img_dir, '*' + img_ext)))
+    img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
+
+    print(f"Loaded {len(img_ids)} images from {img_dir}")
+        
+        
+    
+    train_img_ids, val_img_ids = train_test_split(
+        img_ids,
+        test_size=0.2,
+        random_state=config['dataseed']
+    )
+
     STAGES = [
-    {'img_size': 32, 'epochs': 50, 'lr': 1e-3, 'batch_size': 64},
-    {'img_size': 64, 'epochs': 25, 'lr': 7e-4, 'batch_size': 32},
+    {'img_size': 32, 'epochs': 3, 'lr': 1e-3, 'batch_size': 64},
+    {'img_size': 64, 'epochs': 3, 'lr': 7e-4, 'batch_size': 32},
     {'img_size': 128, 'epochs': 15, 'lr': 5e-4, 'batch_size': 32},
     {'img_size': 224, 'epochs': 10, 'lr': 2e-4, 'batch_size': 8 },
     ]
@@ -351,102 +446,6 @@ def main():
     counter = 0
 
     for stage in STAGES:
-
-        for name, param in model.named_parameters():
-            if 'layer' in name.lower() and 'fc' in name.lower():  # higher lr for kan layers
-                param_groups.append({
-                    'params': param,
-                    'lr': config['kan_lr'],
-                    'weight_decay': config['kan_weight_decay']
-                })
-            else:
-                param_groups.append({
-                    'params': param,
-                    'lr': stage['lr'],
-                    'weight_decay': config['weight_decay']
-                })
-
-        stage_condition = stage == STAGES[0]
-        if config['optimizer'] == 'Adam' and stage_condition:
-            optimizer = optim.Adam(param_groups)
-        elif config['optimizer'] == 'AdamW' and stage_condition:
-            optimizer = optim.AdamW(param_groups)
-        elif config['optimizer'] == 'SGD' and stage_condition:
-            optimizer = optim.SGD(
-                param_groups,
-                lr=config['lr'],
-                momentum=config['momentum'],
-                nesterov=config['nesterov'],
-                weight_decay=config['weight_decay']
-            )
-        else:
-            optimizer = temp
-        
-        temp = optimizer
-        
-        # Resume from checkpoint if provided
-        start_epoch = 0 if stage == STAGES[0] else counter
-        log = OrderedDict([
-            ('epoch', []),
-            ('lr', []),
-            ('loss', []),
-            ('iou', []),
-        ])
-        if config['resume_from']:
-            print(f"=> resuming from checkpoint: {config['resume_from']}")
-            checkpoint = torch.load(config['resume_from'], map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            log = checkpoint.get('log', log)
-            print(f"=> resuming at epoch {start_epoch}/{config['epochs']}")
-
-        if config['scheduler'] == 'CosineAnnealingLR':
-            scheduler = lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=config['epochs'], eta_min=config['min_lr'],
-                last_epoch=start_epoch - 1
-            )
-        elif config['scheduler'] == 'ReduceLROnPlateau':
-            scheduler = lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                factor=config['factor'],
-                patience=config['patience'],
-                verbose=1,
-                min_lr=config['min_lr']
-            )
-        elif config['scheduler'] == 'MultiStepLR':
-            scheduler = lr_scheduler.MultiStepLR(
-                optimizer,
-                milestones=[int(e) for e in config['milestones'].split(',')],
-                gamma=config['gamma'],
-                last_epoch=start_epoch - 1
-            )
-        elif config['scheduler'] == 'ConstantLR':
-            scheduler = None
-        else:
-            raise NotImplementedError
-        
-
-        shutil.copy2('train.py', f'{output_dir}/{exp_name}/')
-        shutil.copy2('src/archs.py', f'{output_dir}/{exp_name}/')
-
-        # Data loading code
-        img_dir = os.path.join(config['data_dir'], config['dataset'], 'images')
-        mask_dir = os.path.join(config['data_dir'], config['dataset'], 'masks')
-
-        img_ids = sorted(glob(os.path.join(img_dir, '*' + img_ext)))
-        img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
-
-        print(f"Loaded {len(img_ids)} images from {img_dir}")
-        
-        
-    
-        train_img_ids, val_img_ids = train_test_split(
-            img_ids,
-            test_size=0.2,
-            random_state=config['dataseed']
-        )
-
         train_transform = A.Compose([
             A.RandomRotate90(),
             A.HorizontalFlip(),
